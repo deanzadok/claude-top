@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+"""claude-top: live view of Claude Code usage, in the spirit of nvtop.
+
+Plan limits (5-hour / weekly) come from the status line script
+(~/.claude/usage-monitor/statusline.py), which saves them after every Claude reply.
+Token counts come from Claude Code's local logs in ~/.claude/projects.
+
+The layout adapts to the window: narrow windows drop less important columns, short
+windows drop whole sections (least important first), spare height makes the activity
+graph taller, and windows 140+ columns wide split into two columns.
+
+Keys: q quit, r rescan logs, t next color theme (T previous). The theme is remembered.
+  claude-top --once               print one plain-text snapshot and exit
+  claude-top --once --size 80x24  snapshot at a given width x height
+  claude-top --theme lagoon       start with a theme (also remembered for next time)
+  claude-top --themes             list themes: claude, midnight, lagoon, ember, paper, classic
+  claude-top --transparent        keep the terminal's own background color
+  claude-top --once --color       force colors in a snapshot (--no-color to turn off)
+"""
+import curses
+import glob
+import json
+import os
+import signal
+import sys
+import time
+from datetime import datetime
+
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+STATE = os.path.join(CLAUDE_DIR, "usage-monitor", "state")
+PROJECTS = os.path.join(CLAUDE_DIR, "projects")
+REFRESH_S = 2
+SCAN_S = 5
+KEEP_S = 7 * 86400
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+# ---------- reading the logs ----------
+
+class LogScanner:
+    """Reads new lines from the transcript files incrementally and keeps one
+    record per API reply (replies are logged several times; we dedupe by id)."""
+
+    def __init__(self):
+        self.offsets = {}   # path -> (inode, byte offset)
+        self.records = {}   # (message id, request id) -> record
+
+    def scan(self):
+        cutoff = time.time() - KEEP_S
+        for path in glob.glob(os.path.join(PROJECTS, "**", "*.jsonl"), recursive=True):
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_mtime < cutoff:
+                continue
+            inode, off = self.offsets.get(path, (st.st_ino, 0))
+            if inode != st.st_ino or st.st_size < off:
+                off = 0
+            if st.st_size == off:
+                continue
+            project = os.path.relpath(path, PROJECTS).split(os.sep)[0]
+            try:
+                with open(path, "rb") as f:
+                    f.seek(off)
+                    chunk = f.read()
+            except OSError:
+                continue
+            end = chunk.rfind(b"\n")
+            if end < 0:
+                continue
+            for line in chunk[:end].split(b"\n"):
+                if b'"usage"' not in line or b'"assistant"' not in line:
+                    continue
+                self._add(line, project)
+            self.offsets[path] = (st.st_ino, off + end + 1)
+        self.records = {k: r for k, r in self.records.items() if r["t"] >= cutoff}
+
+    def _add(self, line, project):
+        try:
+            d = json.loads(line)
+            if d.get("type") != "assistant":
+                return
+            m = d["message"]
+            u = m["usage"]
+            t = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return
+        if m.get("model") in (None, "<synthetic>"):
+            return
+        key = (m.get("id"), d.get("requestId"))
+        self.records[key] = {
+            "t": t,
+            "model": m.get("model"),
+            "project": os.path.basename((d.get("cwd") or "").rstrip("/")) or short_project(project),
+            "in": u.get("input_tokens") or 0,
+            "out": u.get("output_tokens") or 0,
+            "cr": u.get("cache_read_input_tokens") or 0,
+            "cw": u.get("cache_creation_input_tokens") or 0,
+        }
+
+
+def load_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def load_sessions():
+    out = []
+    now = time.time()
+    for p in glob.glob(os.path.join(STATE, "sessions", "*.json")):
+        s = load_json(p)
+        if not s:
+            continue
+        if now - s.get("captured_at", 0) > KEEP_S:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            continue
+        out.append(s)
+    return sorted(out, key=lambda s: -s.get("captured_at", 0))
+
+
+# ---------- formatting ----------
+
+def human(n):
+    for unit, size in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
+        if n >= size:
+            return f"{n / size:.1f}{unit}"
+    return str(int(n))
+
+
+def ago(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+    return f"{seconds // 86400}d{seconds % 86400 // 3600}h"
+
+
+def short_project(name):
+    # "-home-alex-code-myapp" -> "myapp" (fallback when a log line has no cwd)
+    return name.rstrip("-").split("-")[-1] or name
+
+
+def level(p):
+    return "ok" if p < 50 else "warn" if p < 80 else "bad"
+
+
+# ---------- colors and themes ----------
+# Colors are written as hex. Terminals that allow it (most modern ones) get the exact
+# colors; others get the nearest of their 256 (or 8) colors. Press "t" to switch theme.
+
+THEMES = {
+    "claude": {     # Claude Code's colors on a near-black warm background (default)
+        "bg": "#151412", "text": "#e8e6dc", "dim": "#9c9a92", "faint": "#34322d", "title": "#faf9f5",
+        "accent": "#d97757", "hotkey": "#d97757", "empty": "#2a2925", "cost": "#d4a27f",
+        "live": "#4eba65", "idle": "#5c5a54", "out": "#e8916f", "bar": "#d97757",
+        "box_plan": "#d97757", "box_graph": "#7b8cf7", "box_tokens": "#48968c",
+        "box_models": "#af87ff", "box_sessions": "#e86aa8",
+        "meter": ("#4eba65", "#ffc107", "#ff6b80"),   # Claude Code's success / warning / error
+        "graph": ("#8a3f28", "#d97757", "#f5c9ad"),   # clay -> Claude orange -> peach
+        "models": {"opus": "#d97757", "sonnet": "#7b8cf7", "haiku": "#4eba65", "fable": "#af87ff"},
+    },
+    "midnight": {   # deep navy
+        "bg": "#0a0f1f", "text": "#d0d8f0", "dim": "#7f8bb0", "faint": "#1f2a4a", "title": "#ffffff",
+        "accent": "#5fd7ff", "hotkey": "#ffaf00", "empty": "#182038", "cost": "#ffd75f",
+        "live": "#5fffaf", "idle": "#4a5578", "out": "#5fffd7", "bar": "#5fd7ff",
+        "box_plan": "#5f87ff", "box_graph": "#00afaf", "box_tokens": "#af87ff",
+        "box_models": "#5fafd7", "box_sessions": "#ff875f",
+        "meter": ("#00d7af", "#ffd75f", "#ff5f87"),   # teal -> gold -> pink
+        "graph": ("#1c5fd4", "#00c8ff", "#c8f4ff"),   # blue -> cyan -> ice
+        "models": {"opus": "#d787ff", "sonnet": "#87d7ff", "haiku": "#afff87", "fable": "#ffaf5f"},
+    },
+    "lagoon": {     # very dark teal
+        "bg": "#06191b", "text": "#d7f5f2", "dim": "#7fa7a5", "faint": "#143437", "title": "#ffffff",
+        "accent": "#87ffd7", "hotkey": "#ffd700", "empty": "#102a2c", "cost": "#ffd787",
+        "live": "#87ff87", "idle": "#3f6466", "out": "#afffaf", "bar": "#87ffd7",
+        "box_plan": "#00b894", "box_graph": "#5fafff", "box_tokens": "#c8c878",
+        "box_models": "#6fbcbc", "box_sessions": "#ffaf87",
+        "meter": ("#87ff87", "#ffff5f", "#ff5f5f"),
+        "graph": ("#008f70", "#4fffb0", "#d7ffe8"),
+        "models": {"opus": "#d7afff", "sonnet": "#87d7ff", "haiku": "#d7ff87", "fable": "#ffaf87"},
+    },
+    "ember": {      # near-black with warm colors
+        "bg": "#120e0c", "text": "#e6dcd6", "dim": "#8f8178", "faint": "#2e2520", "title": "#ffffff",
+        "accent": "#ff8700", "hotkey": "#ff5f5f", "empty": "#27201c", "cost": "#ffd700",
+        "live": "#ffaf5f", "idle": "#554a44", "out": "#ffd75f", "bar": "#ff8700",
+        "box_plan": "#d75f00", "box_graph": "#b5544f", "box_tokens": "#c9a000",
+        "box_models": "#a8825c", "box_sessions": "#d75f87",
+        "meter": ("#ffd787", "#ff8700", "#e01010"),
+        "graph": ("#9a1a00", "#ff5f00", "#ffd75f"),
+        "models": {"opus": "#ff87af", "sonnet": "#ffaf87", "haiku": "#d7d787", "fable": "#ff8700"},
+    },
+    "paper": {      # light background
+        "bg": "#f5f4ef", "text": "#262624", "dim": "#6c6a64", "faint": "#c9c7bf", "title": "#000000",
+        "accent": "#c15f3c", "hotkey": "#c15f3c", "empty": "#dedcd4", "cost": "#9a5b00",
+        "live": "#2e8b47", "idle": "#a3a19a", "out": "#b5522f", "bar": "#c15f3c",
+        "box_plan": "#c15f3c", "box_graph": "#4f5fd6", "box_tokens": "#2f7a72",
+        "box_models": "#7d55c7", "box_sessions": "#b8487f",
+        "meter": ("#2e9e50", "#d9a400", "#d63a3a"),
+        "graph": ("#e8b49c", "#c15f3c", "#6b2a14"),
+        "models": {"opus": "#c15f3c", "sonnet": "#4f5fd6", "haiku": "#2e8b47", "fable": "#7d55c7"},
+    },
+    "classic": {    # close to btop's default look
+        "bg": "#0a0a0a", "text": "#cccccc", "dim": "#808080", "faint": "#303030", "title": "#eeeeee",
+        "accent": "#50f095", "hotkey": "#d75f5f", "empty": "#262626", "cost": "#d7af5f",
+        "live": "#50f095", "idle": "#4e4e4e", "out": "#50f095", "bar": "#d0c8ff",
+        "box_plan": "#3d7b46", "box_graph": "#423ba5", "box_tokens": "#8a882e",
+        "box_models": "#2f7f8f", "box_sessions": "#923535",
+        "meter": ("#50f095", "#f2e266", "#fa1e1e"),
+        "graph": ("#3b2f9a", "#6a5fd0", "#d0c8ff"),
+        "models": {"opus": "#c39bff", "sonnet": "#7aa2f7", "haiku": "#9ece6a", "fable": "#ff9e64"},
+    },
+}
+THEME_ORDER = list(THEMES)
+EXACT_COLORS_USED = False
+PREFS = os.path.join(CLAUDE_DIR, "usage-monitor", "prefs.json")   # remembers the theme
+
+THEME, METER_STOPS, GRAPH_STOPS, MODEL_COLORS = {}, (), (), {}
+theme_name = ""
+
+
+def set_theme(name):
+    global THEME, METER_STOPS, GRAPH_STOPS, MODEL_COLORS, theme_name
+    t = THEMES[name]
+    theme_name = name
+    THEME = {k: v for k, v in t.items() if isinstance(v, str)}
+    METER_STOPS, GRAPH_STOPS, MODEL_COLORS = t["meter"], t["graph"], t["models"]
+
+
+def saved_theme():
+    prefs = load_json(PREFS) or {}
+    return prefs.get("theme") if prefs.get("theme") in THEMES else THEME_ORDER[0]
+
+
+def save_theme(name):
+    try:
+        os.makedirs(os.path.dirname(PREFS), exist_ok=True)
+        with open(PREFS, "w") as f:
+            json.dump({"theme": name}, f)
+    except OSError:
+        pass
+
+
+set_theme(THEME_ORDER[0])
+
+_CUBE = (0, 95, 135, 175, 215, 255)
+_BASIC = ((0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0),
+          (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229))
+
+
+def _rgb(hexc):
+    return tuple(int(hexc[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def _dist(a, b):
+    return sum((x - y) ** 2 for x, y in zip(a, b))
+
+
+_xterm_cache = {}
+
+
+def xterm(hexc):
+    """Nearest xterm-256 palette index for a hex color."""
+    if hexc not in _xterm_cache:
+        rgb = _rgb(hexc)
+        idx = [min(range(6), key=lambda i: abs(_CUBE[i] - v)) for v in rgb]
+        cube = 16 + 36 * idx[0] + 6 * idx[1] + idx[2]
+        cube_rgb = tuple(_CUBE[i] for i in idx)
+        g = max(0, min(23, round((sum(rgb) / 3 - 8) / 10)))
+        gray_rgb = (8 + 10 * g,) * 3
+        _xterm_cache[hexc] = cube if _dist(rgb, cube_rgb) <= _dist(rgb, gray_rgb) else 232 + g
+    return _xterm_cache[hexc]
+
+
+def basic(hexc):
+    rgb = _rgb(hexc)
+    return min(range(8), key=lambda i: _dist(rgb, _BASIC[i]))
+
+
+def gradient(stops, t):
+    """Color at position t (0..1) along a list of hex color stops."""
+    t = round(max(0.0, min(1.0, t)) * 23) / 23   # 24 steps keeps the number of colors small
+    seg = min(len(stops) - 2, int(t * (len(stops) - 1)))
+    local = t * (len(stops) - 1) - seg
+    a, b = _rgb(stops[seg]), _rgb(stops[seg + 1])
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * local) for x, y in zip(a, b))
+
+
+def st(name, bold=False):
+    return (THEME[name], bold)
+
+
+def model_color(model):
+    for family, color in MODEL_COLORS.items():
+        if family in (model or ""):
+            return color
+    return THEME["text"]
+
+
+def meter(p, width):
+    """btop-style meter: filled cells colored along the green->red gradient."""
+    fill = round(width * min(max(p, 0), 100) / 100)
+    pieces = []
+    for i in range(width):
+        if i < fill:
+            pieces.append(("■", (gradient(METER_STOPS, i / max(1, width - 1)), False)))
+        else:
+            pieces.append(("■", st("empty")))
+    return pieces
+
+
+def pct_style(p, bold=False):
+    return (gradient(METER_STOPS, min(max(p, 0), 100) / 100), bold)
+
+
+# ---------- screen sections ----------
+# Each section has a title and content lines for a given inner width `w`.
+# A line is a list of (text, style) pieces; a style is (hex color, bold).
+
+GRAPH_MAX_ROWS = 80      # the activity graph grows up to this many rows when there's room
+MAX_SESSIONS = 8
+MAX_GROUPS = 6
+TWO_COLUMN_MIN = 140     # terminals at least this wide get two columns
+SPAN = 5 * 3600
+BRAILLE_LEFT = (0x40, 0x04, 0x02, 0x01)    # dots of the left column, bottom to top
+BRAILLE_RIGHT = (0x80, 0x20, 0x10, 0x08)   # dots of the right column, bottom to top
+
+
+def header_line(w):
+    clock = time.strftime("%H:%M:%S")
+    if w < 64:
+        return [("✻ claude-top ", st("accent", True)), (clock, st("text", True))]
+    left = [(" ✻ claude", st("accent", True)), ("-top ", st("title", True))]
+    keys = [(" ", None), ("q", st("hotkey", True)), (" quit  ", st("dim")),
+            ("r", st("hotkey", True)), (" rescan  ", st("dim")),
+            ("t", st("hotkey", True)), (" theme", st("dim"))]
+    name, ms, pad = (f":{theme_name}", st("text")), (f"  {REFRESH_S * 1000}ms", st("dim")), (" ", None)
+    mid = f" {time.strftime('%a')} {clock} "
+    lw = sum(len(t) for t, _ in left)
+    for extra in ([name, ms, pad], [name, pad], [pad], []):   # drop extras until it fits
+        right = keys + extra
+        if w - lw - sum(len(t) for t, _ in right) - len(mid) >= 4:
+            break
+    rw = sum(len(t) for t, _ in right)
+    gap = w - lw - rw - len(mid)
+    a = max(1, gap // 2)
+    b = max(1, gap - a)
+    return left + [("─" * a, st("faint")), (mid, st("title", True)), ("─" * b, st("faint"))] + right
+
+
+def plan_title(w, recs):
+    return "plan limits", ""
+
+
+def plan_content(k, w):
+    now = time.time()
+    rl_file = load_json(os.path.join(STATE, "rate_limits.json"))
+    if not rl_file:
+        if w >= 60:
+            return [[("No plan data yet. It appears after the next Claude reply", st("dim"))],
+                    [("(needs the status line set up, and a Pro/Max/Ultra plan).", st("dim"))]]
+        return [[("No data until the next reply.", st("dim"))]]
+    rl = rl_file.get("rate_limits") or {}
+    rows = []
+    for key, label, short in (("five_hour", "5-hour", "5h"), ("seven_day", "Weekly", "wk"), ("spend_limit", "Spend", "$")):
+        win = rl.get(key)
+        if not isinstance(win, dict) or win.get("used_percentage") is None:
+            continue
+        p = float(win["used_percentage"])
+        lab = f"{label:<7}" if w >= 36 else f"{short:<3}"
+        resets = win.get("resets_at")
+        if resets and resets < now:
+            rows.append((lab, None, "", ""))
+            continue
+        pct_txt = f" {p:5.1f}%" if w >= 36 else f" {p:3.0f}%"
+        tail = ""
+        if resets and w >= 68:
+            when = time.strftime("%H:%M" if resets - now < 86400 else "%a %H:%M", time.localtime(resets))
+            tail = f"   resets in {ago(resets - now)} ({when})"
+        elif resets and w >= 40:
+            tail = f"  in {ago(resets - now)}"
+        if key == "spend_limit" and win.get("limit_usd") and w >= 96:
+            tail += f"   ${win.get('used_usd', 0):.2f} / ${win['limit_usd']:.2f}"
+        rows.append((lab, p, pct_txt, tail))
+    lines = []
+    if rows:
+        bar_w = max(4, min(60, w - max(len(r[0]) + len(r[2]) + len(r[3]) for r in rows)))
+        for lab, p, pct_txt, tail in rows:
+            if p is None:
+                lines.append([(lab, st("title", True)), ("reset; updates on next reply", st("dim"))])
+                continue
+            lines.append([(lab, st("title", True))] + meter(p, bar_w) +
+                         [(pct_txt, pct_style(p, True)), (tail, st("dim"))])
+    age = ago(now - rl_file.get("captured_at", now))
+    lines.append([(f"as of {age} ago" if w >= 26 else f"{age} ago", st("dim"))])
+    return lines
+
+
+_bins_cache = {}
+
+
+def graph_bins(w, recs):
+    key = (w, len(recs), int(time.time()))
+    if key not in _bins_cache:
+        _bins_cache.clear()
+        _bins_cache[key] = _graph_bins(w, recs)
+    return _bins_cache[key]
+
+
+def _graph_bins(w, recs):
+    cells = max(4, min(w, 200))
+    n = cells * 2                     # two time bins per character (braille has 2 dot columns)
+    step = SPAN / n
+    bins = [0] * n
+    now = time.time()
+    for r in recs:
+        age = now - r["t"]
+        if 0 <= age < SPAN:
+            bins[n - 1 - int(age // step)] += r["out"]
+    return bins, step
+
+
+def graph_title(w, recs):
+    bins, step = graph_bins(w, recs)
+    peak = max(bins)
+    if w >= 60:
+        return "output tokens · last 5h", f"peak {human(peak)} per {step / 60:.1f} min"
+    if w >= 30:
+        return "output · 5h", f"peak {human(peak)}"
+    return "output 5h", ""
+
+
+def graph_content(k, w, recs):
+    rows = k + 1
+    bins, _ = graph_bins(w, recs)
+    peak = max(bins) or 1
+    levels = rows * 4
+    hts = [0 if b == 0 else max(1, round(b / peak * levels)) for b in bins]
+    lines = []
+    for row in range(rows - 1, -1, -1):
+        color = gradient(GRAPH_STOPS, row / max(1, rows - 1)) if rows > 1 else GRAPH_STOPS[1]
+        pieces = []
+        for c in range(len(bins) // 2):
+            lft = max(0, min(4, hts[2 * c] - row * 4))
+            rgt = max(0, min(4, hts[2 * c + 1] - row * 4))
+            code = sum(BRAILLE_LEFT[:lft]) + sum(BRAILLE_RIGHT[:rgt])
+            if code:
+                pieces.append((chr(0x2800 + code), (color, False)))
+            elif row == 0:
+                pieces.append(("⣀", st("faint")))   # faint baseline, like btop
+            else:
+                pieces.append((" ", None))
+        lines.append(pieces)
+    # time axis with hour ticks
+    cells = len(bins) // 2
+    axis = [" "] * cells
+    marks = [("now", cells - 3)]
+    if cells >= 30:
+        marks += [(f"-{h}h", round(cells * (1 - h / 5))) for h in (1, 2, 3, 4)]
+    marks.append(("-5h", 0))
+    for text, pos in marks:
+        pos = max(0, min(cells - len(text), pos))
+        if all(c == " " for c in axis[max(0, pos - 1):pos + len(text) + 1]):
+            axis[pos:pos + len(text)] = list(text)
+    lines.append([("".join(axis), st("dim"))])
+    return lines
+
+
+def tokens_content(k, w, recs):
+    now = time.time()
+    midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    periods = (("Last hour", "1h", now - 3600), ("Last 5 h", "5h", now - SPAN),
+               ("Today", "today", midnight), ("Last 7 days", "7d", now - KEEP_S))
+    hd = st("title", True)
+    if w >= 64:
+        lines = [[(f"{'':<12}{'replies':>9}{'input':>9}{'output':>9}{'cache read':>12}{'cache write':>13}", hd)]]
+    elif w >= 39:
+        lines = [[(f"{'':<12}{'replies':>8}{'output':>9}{'cache rd':>10}", hd)]]
+    else:
+        lines = [[(f"{'':<6}{'replies':>8}{'output':>8}", hd)]]
+    for label, short, since in periods:
+        sel = [r for r in recs if r["t"] >= since]
+        n, inp, out = len(sel), human(sum(r["in"] for r in sel)), human(sum(r["out"] for r in sel))
+        cr, cw = human(sum(r["cr"] for r in sel)), human(sum(r["cw"] for r in sel))
+        if w >= 64:
+            lines.append([(f"{label:<12}", st("text", True)), (f"{n:>9}{inp:>9}", st("text")),
+                          (f"{out:>9}", st("out", True)), (f"{cr:>12}{cw:>13}", st("dim"))])
+        elif w >= 39:
+            lines.append([(f"{label:<12}", st("text", True)), (f"{n:>8}", st("text")),
+                          (f"{out:>9}", st("out", True)), (f"{cr:>10}", st("dim"))])
+        else:
+            lines.append([(f"{short:<6}", st("text", True)), (f"{n:>8}", st("text")),
+                          (f"{out:>8}", st("out", True))])
+    return lines
+
+
+def model_groups(recs):
+    cutoff = time.time() - SPAN
+    groups = {}
+    for r in recs:
+        if r["t"] >= cutoff:
+            g = groups.setdefault((r["model"], r["project"]), [0, 0])
+            g[0] += 1
+            g[1] += r["out"]
+    return sorted(groups.items(), key=lambda kv: -kv[1][1])[:MAX_GROUPS]
+
+
+def models_content(k, w, groups):
+    top = max((g[1][1] for g in groups), default=1) or 1
+    lines = []
+    for (model, proj), (cnt, out) in groups[:k + 1]:
+        mc = (model_color(model), True)
+        share = out / top
+        if w >= 70:
+            bar = round(10 * share)
+            lines.append([(f"{model:<20.20} ", mc), (f"{proj:<20.20}", st("text")),
+                          (f"{cnt:>5} replies ", st("dim")), (f"{human(out):>7} ", st("title", True)),
+                          ("■" * bar, st("bar")), ("■" * (10 - bar), st("empty"))])
+        else:
+            m = model.replace("claude-", "")
+            pw = max(4, w - 11 - 8)
+            lines.append([(f"{m:<10.10} ", mc), (f"{proj:<{pw}.{pw - 1}}", st("text")),
+                          (f"{human(out):>8}", st("title", True))])
+    return lines
+
+
+def sessions_content(k, w, sessions):
+    now = time.time()
+    if not sessions:
+        return [[("None yet. Sessions appear after their next reply.", st("dim"))]]
+    full = w >= 62
+    hd = st("title", True)
+    pw = max(6, w - 2 - 5 - 8)
+    if full:
+        lines = [[(f"  {'project':<18}{'model':<12}{'context':<12}{'cost*':>8}{'last reply':>12}", hd)]]
+    else:
+        lines = [[(f"  {'project':<{pw}}{'ctx':>5}{'last':>8}", hd)]]
+    for s in sessions[:k + 1]:
+        ctxp = (s.get("context") or {}).get("used_percentage")
+        cost = (s.get("cost") or {}).get("total_cost_usd")
+        proj = os.path.basename((s.get("cwd") or "?").rstrip("/")) or "/"
+        age = now - s.get("captured_at", now)
+        live = age < 600
+        dot = ("● ", st("live" if live else "idle"))
+        name = st("text", True) if live else st("dim")
+        model = str(s.get("model"))
+        if full:
+            row = [dot, (f"{proj:<18.17}", name), (f"{model:<12.11}", (model_color(model), False) if live else st("dim"))]
+            if ctxp is not None:
+                row += meter(ctxp, 6) + [(f"{ctxp:>4.0f}% ", pct_style(ctxp) if live else st("dim"))]
+            else:
+                row.append((f"{'-':<12}", st("dim")))
+            row += [(f"{'$%.2f' % cost if cost is not None else '-':>8}", st("cost") if live else st("dim")),
+                    (f"{ago(age) + ' ago':>12}", st("dim"))]
+            lines.append(row)
+        else:
+            lines.append([dot, (f"{proj:<{pw}.{pw - 1}}", name),
+                          (f"{ctxp:>4.0f}%" if ctxp is not None else f"{'-':>5}",
+                           pct_style(ctxp or 0) if live else st("dim")),
+                          (f"{ago(age):>8}", st("dim"))])
+    if full and w >= 86 and k + 1 >= len(sessions):
+        lines.append([("* estimated at API list prices; on a subscription the plan limits are what count", st("faint"))])
+    return lines
+
+
+# ---------- layout ----------
+
+class Section:
+    def __init__(self, name, prio, grow, kmax, title, content, nlines=None):
+        self.name = name        # also picks the border color: THEME["box_" + name]
+        self.prio = prio        # lower = kept first when space is short
+        self.grow = grow        # lower = gets spare rows first
+        self.kmax = kmax        # how far the section can grow (graph rows / list items)
+        self.title = title      # title(width) -> (left title, right title)
+        self._content = content # content(k, width) -> lines
+        self._nlines = nlines   # optional fast nlines(k, width), to skip building content
+        self._cache = {}
+
+    def content(self, k, width):
+        if (k, width) not in self._cache:
+            self._cache[(k, width)] = self._content(k, width)
+        return self._cache[(k, width)]
+
+    def nlines(self, k, width):
+        return self._nlines(k, width) if self._nlines else len(self.content(k, width))
+
+
+def _choose(sections, height, rows_of):
+    """Take sections in priority order while they fit (stop at the first that doesn't),
+    then give spare rows to sections that can grow. Returns ({section: k}, rows used)."""
+    size, used = {}, 0
+    for s in sorted(sections, key=lambda s: s.prio):
+        n = rows_of(s, 0)
+        if used + n > height:
+            break
+        size[s] = 0
+        used += n
+    for s in sorted(size, key=lambda s: s.grow):
+        while size[s] < s.kmax:
+            delta = rows_of(s, size[s] + 1) - rows_of(s, size[s])
+            if used + delta > height:
+                break
+            size[s] += 1
+            used += delta
+    return size, used
+
+
+def draw_box(out, y, x, w, h, section, k):
+    border = st("box_" + section.name)
+    title, right = section.title(w - 4)
+    iw = w - 4
+    title = title[: max(0, w - 6)]
+    top = [("╭─┐", border), (title, st("title", True)), ("┌", border)]
+    used = 4 + len(title)
+    if right and used + len(right) + 4 <= w:
+        top += [("─" * (w - used - len(right) - 4), border), ("┐", border), (right, st("text")), ("┌─╮", border)]
+    else:
+        top += [("─" * max(0, w - used - 1), border), ("╮", border)]
+    place(out, y, x, w, [top])
+    content = section.content(k, iw)[: h - 2]
+    for i in range(h - 2):
+        out.append((y + 1 + i, x, "│", border))
+        out.append((y + 1 + i, x + w - 1, "│", border))
+    place(out, y + 1, x + 2, iw, content)
+    place(out, y + h - 1, x, w, [[("╰" + "─" * (w - 2) + "╯", border)]])
+
+
+def layout_column(out, sections, top, x, width, height):
+    """Draw sections in boxes, stretching the last box to the bottom like btop.
+    If boxes would hide sections that fit without them, use a compact borderless view."""
+    boxed, used_b = _choose(sections, height, lambda s, k: s.nlines(k, width - 4) + 2)
+    flat, used_f = _choose(sections, height, lambda s, k: s.nlines(k, width - 1) + 1)
+    if len(boxed) >= len(flat) and boxed:
+        shown = [s for s in sections if s in boxed]
+        y = top
+        for i, s in enumerate(shown):
+            h = s.nlines(boxed[s], width - 4) + 2
+            if i == len(shown) - 1:
+                h += height - used_b
+            draw_box(out, y, x, width, h, s, boxed[s])
+            y += h
+        return
+    if not flat:   # not even one section fits: show the most important one, cut off
+        s = min(sections, key=lambda s: s.prio)
+        flat = {s: 0}
+    y = top
+    for s in [s for s in sections if s in flat]:
+        title, right = s.title(width - 1)
+        lines = [[(title, (THEME["box_" + s.name], True)), ("  " + right if right else "", st("dim"))]]
+        lines += [[(" ", None)] + ln for ln in s.content(flat[s], width - 1)]
+        lines = lines[: top + height - y]
+        place(out, y, x, width, lines)
+        y += len(lines)
+
+
+def place(out, y, x, width, lines):
+    for i, pieces in enumerate(lines):
+        col = x
+        for text, style in pieces:
+            text = text[: max(0, x + width - col)]
+            if text:
+                out.append((y + i, col, text, style))
+                col += len(text)
+
+
+def frame(scanner, h, w):
+    """Lay out the whole screen for h rows x w columns. Returns (row, col, text, style) items."""
+    if w < 24 or h < 3:
+        msg = "claude-top: window too small" if w >= 30 else "too small"
+        return [(0, 0, msg[: max(1, w - 1)], st("hotkey", True))]
+    usable = w - 1  # never write the last column (avoids curses errors at the corner)
+    now = time.time()
+    recs = list(scanner.records.values())
+    sessions = [s for s in load_sessions() if now - s.get("captured_at", 0) < 24 * 3600][:MAX_SESSIONS]
+    groups = model_groups(recs)
+
+    out = []
+    place(out, 0, 0, usable, [header_line(usable)])
+    top, avail = 1, h - 1
+
+    plan = Section("plan", 1, 9, 0, lambda cw: plan_title(cw, recs), lambda k, cw: plan_content(k, cw))
+    graph = Section("graph", 2, 3, GRAPH_MAX_ROWS - 1, lambda cw: graph_title(cw, recs),
+                    lambda k, cw: graph_content(k, cw, recs), nlines=lambda k, cw: k + 2)
+    tokens = Section("tokens", 3, 9, 0, lambda cw: ("tokens · all sessions", ""),
+                     lambda k, cw: tokens_content(k, cw, recs))
+    sess = Section("sessions", 4, 1, max(0, len(sessions) - 1),
+                   lambda cw: ("sessions · last 24h", f"{len(sessions)} seen"),
+                   lambda k, cw: sessions_content(k, cw, sessions))
+    models = Section("models", 5, 2, max(0, len(groups) - 1), lambda cw: ("by model / project · 5h", ""),
+                     lambda k, cw: models_content(k, cw, groups))
+    right = [tokens] + ([models] if groups else []) + [sess]
+
+    if w >= TWO_COLUMN_MIN:
+        left_w = usable // 2
+        layout_column(out, [plan, graph], top, 0, left_w, avail)
+        layout_column(out, right, top, left_w, usable - left_w, avail)
+    else:
+        layout_column(out, [plan, graph] + right, top, 0, usable, avail)
+    return out
+
+
+# ---------- output ----------
+
+class Painter:
+    """Turns (hex color, bold) styles into curses attributes, creating color pairs on demand.
+
+    If the terminal lets programs redefine its palette, each hex color gets its own palette
+    slot set to the exact color (the palette is restored on exit). Otherwise colors are
+    matched to the nearest of the terminal's 256 (or 8) colors."""
+
+    def __init__(self, transparent):
+        self.c256 = curses.COLORS >= 256
+        self.exact = (self.c256 and curses.can_change_color()
+                      and not os.environ.get("CLAUDE_TOP_NO_EXACT_COLORS"))
+        self.transparent = transparent
+        self.max_pairs = min(curses.COLOR_PAIRS, 256) - 1
+        self.reset()
+
+    def reset(self):
+        """Call after switching theme: new background, colors and pairs rebuilt on demand."""
+        self.slots = {}
+        self.pairs = {}
+        self.bg = -1 if (self.transparent or not self.c256) else self.color(THEME["bg"])
+
+    def color(self, hexc):
+        if not self.c256:
+            return basic(hexc)
+        if not self.exact:
+            return xterm(hexc)
+        if hexc not in self.slots:
+            idx = 16 + len(self.slots)
+            if idx > 255:   # out of palette slots (not expected): fall back to text color
+                return self.slots.get(THEME["text"], 16)
+            global EXACT_COLORS_USED
+            EXACT_COLORS_USED = True
+            r, g, b = _rgb(hexc)
+            curses.init_color(idx, r * 1000 // 255, g * 1000 // 255, b * 1000 // 255)
+            self.slots[hexc] = idx
+        return self.slots[hexc]
+
+    def attr(self, style):
+        if not style:
+            style = st("text")
+        hexc, bold = style
+        fg = self.color(hexc)
+        key = (fg, self.bg)
+        if key not in self.pairs:
+            if len(self.pairs) >= self.max_pairs:
+                return curses.A_BOLD if bold else 0
+            n = len(self.pairs) + 1
+            curses.init_pair(n, fg, self.bg)
+            self.pairs[key] = n
+        return curses.color_pair(self.pairs[key]) | (curses.A_BOLD if bold else 0)
+
+
+def run_curses(stdscr, scanner, transparent):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    curses.use_default_colors()
+    paint = Painter(transparent)
+    stdscr.bkgd(" ", paint.attr(st("text")))
+    stdscr.timeout(REFRESH_S * 1000)
+    last_scan = 0
+    while True:
+        if time.time() - last_scan >= SCAN_S:
+            scanner.scan()
+            last_scan = time.time()
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        for y, x, text, style in frame(scanner, h, w):
+            if y < h and x < w:
+                try:
+                    stdscr.addstr(y, x, text, paint.attr(style))
+                except curses.error:
+                    pass
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key == curses.KEY_RESIZE:
+            stdscr.clear()  # full repaint at the new size, right away
+            continue
+        if key in (ord("q"), ord("Q"), 27):
+            return
+        if key in (ord("t"), ord("T")):
+            step = 1 if key == ord("t") else -1
+            set_theme(THEME_ORDER[(THEME_ORDER.index(theme_name) + step) % len(THEME_ORDER)])
+            save_theme(theme_name)
+            paint.reset()
+            stdscr.bkgd(" ", paint.attr(st("text")))
+            stdscr.clear()
+            continue
+        if key in (ord("r"), ord("R")):
+            scanner.offsets.clear()
+            scanner.records.clear()
+            last_scan = 0
+
+
+def snapshot(scanner, h, w, color, transparent):
+    grid = [[(" ", None)] * w for _ in range(h)]
+    for y, x, text, style in frame(scanner, h, w):
+        for i, ch in enumerate(text):
+            if y < h and x + i < w:
+                grid[y][x + i] = (ch, style)
+    rows = []
+    for r in grid:
+        while r and r[-1][0] == " ":
+            r = r[:-1]
+        rows.append(r)
+    while rows and not rows[-1]:
+        rows.pop()
+    for r in rows:
+        if not color:
+            print("".join(ch for ch, _ in r))
+            continue
+        truecolor = os.environ.get("COLORTERM") in ("truecolor", "24bit")
+
+        def sgr(hexc, layer):   # layer 38 = text color, 48 = background
+            return f"{layer};2;%d;%d;%d" % _rgb(hexc) if truecolor else f"{layer};5;{xterm(hexc)}"
+
+        bg = "" if transparent else f"\x1b[{sgr(THEME['bg'], 48)}m"
+        line = []
+        for ch, style in r:
+            hexc, bold = style or st("text")
+            line.append(f"\x1b[0m{bg}\x1b[{'1;' if bold else ''}{sgr(hexc, 38)}m{ch}")
+        print("".join(line) + "\x1b[0m")
+
+
+def main():
+    args = sys.argv[1:]
+    if "-h" in args or "--help" in args:
+        print(__doc__.strip())
+        return
+    transparent = "--transparent" in args
+    if "--themes" in args:
+        print("Themes (press t / T in claude-top to cycle):", ", ".join(THEME_ORDER))
+        return
+    if "--theme" in args:
+        name = args[args.index("--theme") + 1] if args.index("--theme") + 1 < len(args) else ""
+        if name not in THEMES:
+            sys.exit(f"Unknown theme '{name}'. Choose from: {', '.join(THEME_ORDER)}")
+        set_theme(name)
+        if "--once" not in args:   # a snapshot is a preview; don't change the saved choice
+            save_theme(name)
+    else:
+        set_theme(saved_theme())
+    scanner = LogScanner()
+    if "--once" in args:
+        scanner.scan()
+        if "--size" in args:
+            w, h = (int(v) for v in args[args.index("--size") + 1].lower().split("x"))
+        elif sys.stdout.isatty():
+            w, h = os.get_terminal_size()
+        else:
+            w, h = 100, 60
+        color = "--color" in args or (sys.stdout.isatty() and "--no-color" not in args)
+        snapshot(scanner, h, w, color, transparent)
+        return
+    print("Reading Claude Code logs...", flush=True)
+    scanner.scan()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
+    try:
+        curses.wrapper(run_curses, scanner, transparent)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if EXACT_COLORS_USED:   # give the terminal its own palette back
+            sys.stdout.write("\x1b]104\x07")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
