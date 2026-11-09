@@ -106,4 +106,4 @@ esac
 
 echo
 echo "Done. Run 'claude-top' in a separate terminal (q to quit)."
-echo "Plan-limit bars fill in after Claude's next reply in any Claude Code session."
+echo "Plan-limit bars fill in within a few seconds (checked every 60 s)."

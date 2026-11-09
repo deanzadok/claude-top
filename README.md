@@ -1,9 +1,11 @@
 # claude-top
 
 A live terminal view of your Claude Code usage, in the spirit of `nvtop` / `htop`.
-It shows how much of your plan's 5-hour and weekly limits you've used, when they
-reset, token activity across all sessions, and which sessions are running. It also
-adds a one-line usage summary to the bottom of every Claude Code session.
+It shows how much of your plan's 5-hour, weekly and per-model (for example Fable)
+limits you've used, when they reset, token activity across all sessions, and which
+sessions are running. The plan numbers refresh every 60 seconds and include usage from
+everywhere: the terminal, the **VS Code extension**, the desktop app and claude.ai. It
+also adds a one-line usage summary to the bottom of every terminal Claude Code session.
 
 ![claude-top in a wide terminal](docs/screenshot.png)
 
@@ -51,7 +53,7 @@ pane to a full-screen two-column view (see [Window size](#window-size)).
 |---|---|
 | **Operating system** | Linux or macOS. On Windows, use WSL. Native Windows Python has no `curses` module, so `claude-top` won't run there. |
 | **Python** | 3.8 or newer, with the standard `curses` module (included with Python on Linux and macOS). **No pip packages needed.** Only the standard library is used. |
-| **Claude Code** | The Claude Code CLI, installed and signed in. Any recent version with status line support. |
+| **Claude Code** | The Claude Code CLI (`claude` command), installed and signed in. Tested with 2.1.318. The 60-second plan check uses an experimental option of the `claude` command; if a future version drops it, `claude-top` falls back to the status line (see [Update frequency](#update-frequency)). |
 | **Plan** | **Plan-limit bars (5-hour / weekly):** a claude.ai **Pro, Max or Ultra** subscription. Claude Code only shares those numbers for these plans. On API-key or other plans, everything else (token totals, activity graph, sessions, cost estimate) still works, and the plan section stays empty. See [Plans and limits](#plans-and-limits). |
 | **Terminal** | Any terminal with UTF-8 and 256 colors (GNOME Terminal, iTerm2, Windows Terminal + WSL, Konsole, kitty, Alacritty, tmux, etc.). 8-color terminals work with simpler colors. The font needs box-drawing and braille characters; the default fonts on Linux and macOS have them (if `btop` looks right, `claude-top` will too). Any size from 24 × 3 up; about 80 × 30 shows every section, and 140+ columns gives a two-column view. |
 | **Shell tools (installer only)** | `bash`, `install`, `tail`. These are standard on Linux and macOS. |
@@ -182,13 +184,15 @@ echo "$input" | your-existing-statusline-command
 ## Usage
 
 ```bash
-claude-top            # live, full-screen view (q/Esc quit, r rescan logs, t/T next/previous theme)
+claude-top            # live, full-screen view (q/Esc quit, r rescan + re-check now, t/T next/previous theme)
 claude-top --once     # print one plain-text snapshot and exit (handy for scripts / SSH)
 claude-top --once --size 60x20   # snapshot as it would look in a 60x20 window
 claude-top --theme paper          # start with a theme (remembered for next time)
 claude-top --themes               # list the themes
 claude-top --transparent         # use your terminal's own background instead of the theme's
 claude-top --once --color        # keep colors when piping a snapshot (--no-color to drop them)
+claude-top --check-every 120     # check plan limits every 2 minutes instead of every minute (minimum 30)
+claude-top --no-check            # never run `claude`; plan numbers come only from the status line
 claude-top --help
 ```
 
@@ -199,7 +203,7 @@ session.
 
 | Section | Meaning |
 |---|---|
-| **Plan limits** | Percentage of your 5-hour and weekly (7-day) allowance used, with time until each resets. "As of" says how old the numbers are (see [Update frequency](#update-frequency)). A **Spend** row appears only if your organization set a spend limit. |
+| **Plan limits** | Percentage of your 5-hour and weekly (7-day) allowance used, with time until each resets. If your plan has a separate weekly limit for a model, it gets its own row named after the model (for example **Fable**). "As of" says how old the numbers are (see [Update frequency](#update-frequency)). A **Spend** row appears only if extra usage or a spend limit is turned on. |
 | **Output tokens, last 5 hours** | Bar graph of tokens Claude wrote, across all sessions. Each column is a few minutes, depending on terminal width. |
 | **Tokens** | Totals for the last hour, last 5 h, today (since local midnight) and last 7 days. *replies* = number of Claude responses (including subagents). *cache read / write* = prompt caching, which is most of the input volume in long sessions. |
 | **By model / project** | Where the last 5 hours of output went. |
@@ -324,6 +328,9 @@ just the plan bars, the graph and the token totals.
 ## How it works
 
 ```
+ claude-top, every 60 s: runs `claude` and asks for the plan limits (the same
+ numbers /usage shows; no prompt is sent) ──▶ state/plan_checked.json
+
  ┌──────────────── Claude Code (every session) ───────────────┐
  │ after each reply, runs the status line command and passes  │
  │ JSON on stdin: model, context %, cost, and rate_limits     │
@@ -338,12 +345,18 @@ just the plan bars, the graph and the token totals.
                  │                                 │
                  └──────────────┬──────────────────┘
                                 ▼
-                     claude-top (reads both, redraws every 2 s)
+                     claude-top (reads all of these, redraws every 2 s)
 ```
 
-- **Plan limits come only from the status line.** Claude Code doesn't publish them
-  anywhere else on disk, and `claude-top` doesn't call any API. So the status line
-  script must be installed for the bars to appear.
+- **Plan limits come from two places, and the newer one wins.**
+  1. **The 60-second check.** `claude-top` runs `claude` in the background and sends it
+     a single "get usage" request, the same one the VS Code extension uses to show
+     usage. `claude` answers with your account's limits and exits after about a second.
+     No prompt is sent to Claude, so the check uses none of your limits. It uses your
+     existing Claude Code sign-in; `claude-top` never reads your credentials itself.
+     Because the numbers come from your account, they include usage from everywhere.
+     This is also the only source of per-model limits such as Fable.
+  2. **The status line**, after every reply in a terminal session.
 - **Token counts come from Claude Code's own logs** in `~/.claude/projects/`. Each reply
   is logged with its token usage. `claude-top` reads new lines incrementally and counts
   each reply once, since replies can appear several times in a log. Only logs changed
@@ -359,23 +372,21 @@ just the plan bars, the graph and the token totals.
 |---|---|
 | Screen, clock, reset countdowns | every 2 seconds |
 | Token totals, activity graph, model/project breakdown | every 5 seconds (new replies from any session) |
-| 5-hour / weekly percentages | whenever Claude replies in **any** session |
+| 5-hour / weekly / per-model percentages | every 60 seconds (`--check-every` to change), after each terminal reply, and when you press `r` |
 | Sessions list | after each reply in that session |
 
-When no session is active, the plan bars keep their last value and show "as of …
-ago". When a window resets, the bar says so until the next reply brings a fresh figure.
+**VS Code extension users:** the extension's chat panel doesn't run status lines, so
+before the 60-second check existed, VS Code usage only showed up after the next
+terminal reply. The check fixes this: VS Code usage appears within a minute.
 
-**Why the plan bars can't refresh on a timer (for example every 60 seconds):** Claude
-Code only hands out the plan percentages together with Claude's replies. There is no
-documented way to ask for them in between, and `claude-top` doesn't call any API.
-(Claude Code's status line `refreshInterval` setting only re-runs the script with the
-same cached numbers, so it wouldn't help.)
+**If the check can't run** (no `claude` on your PATH, signed out, or a Claude Code
+version without this option), the plan box shows `⚠ live check: …` with the reason
+and falls back to the status line's numbers. Replies that came in after those numbers
+(for example from VS Code) are then flagged as "not counted yet".
 
-**An old figure is usually still right.** Your usage only goes up when Claude does
-work, so if no session has replied for a while, your usage hasn't moved either. The
-exception is using Claude somewhere this computer can't see: claude.ai in the browser,
-the phone or desktop app, or Claude Code on another machine. That usage counts toward
-the same limits and appears here after the next reply on this computer.
+**The check is experimental.** Claude Code marks this request as one that may change.
+If an update breaks it, you'll see the warning above and everything else keeps
+working. Use `claude-top --no-check` to turn it off entirely.
 
 ---
 
@@ -391,13 +402,10 @@ the same limits and appears here after the next reply on this computer.
 
 - **The bars are relative to your own plan.** 40% means 40% of *your* plan's
   allowance, so the same tool works on every tier without any setup.
-- **Limits cover all models together.** Claude Code reports one 5-hour and one weekly
-  figure; it doesn't report per-model limits (for example a separate Fable or Opus
-  allowance). If your plan has one, check it with `/usage` inside Claude Code. Your
-  use of each model is still shown in the *by model / project* panel, from your
-  local logs.
-- **Spend limits.** If your organization uses a Claude apps gateway with a spend
-  cap, a third **Spend** bar appears with dollars used.
+- **Per-model limits.** If your plan has a separate weekly allowance for a model (for
+  example Fable), it appears as its own row named after the model. These rows come only
+  from the 60-second check; the status line doesn't report them.
+- **Spend.** If extra usage or a spend cap is turned on, a **Spend** bar appears.
 
 ---
 
@@ -410,6 +418,7 @@ for a quick test, but the next install overwrites it.)
 | Constant | Default | Meaning |
 |---|---|---|
 | `REFRESH_S` | `2` | Seconds between screen redraws |
+| `CHECK_S` | `60` | Seconds between plan-limit checks (same as `--check-every`) |
 | `SCAN_S` | `5` | Seconds between log scans |
 | `KEEP_S` | `7 * 86400` | How far back to read logs / keep session files |
 | `GRAPH_MAX_ROWS` | `80` | Tallest the activity graph gets when there's spare height |
@@ -444,8 +453,18 @@ Claude Code's own logs.
 
 ## Troubleshooting
 
+**`⚠ live check: …` in the plan box**
+- `` `claude` command not found ``: `claude` isn't on the PATH `claude-top` sees. Set
+  `CLAUDE_TOP_CLAUDE=/full/path/to/claude`.
+- `` `claude` couldn't get usage ``: run `claude` once and sign in (`/login`).
+- `no plan limits for this account`: you're signed in with an API key; see
+  [Plans and limits](#plans-and-limits). Use `--no-check` to hide the message.
+- `` `claude` gave no usage answer ``: your Claude Code version doesn't support the
+  check (update with `claude update`), or a newer version changed it. The status line
+  numbers still work.
+
 **"No plan data yet"**
-- Wait for Claude to reply once in any Claude Code session. The data arrives with replies.
+- Wait a few seconds for the first check, or for Claude to reply once in a terminal session.
 - Check the status line is set: `grep -A3 statusLine ~/.claude/settings.json`.
 - Plan limits are only provided for claude.ai Pro, Max and Ultra plans. API-key sign-ins
   won't show them. See [Plans and limits](#plans-and-limits).
@@ -494,10 +513,13 @@ cp ~/.claude/settings.json.bak-YYYYMMDD-HHMMSS ~/.claude/settings.json
 
 ## Privacy
 
-Everything stays on your machine. `claude-top` makes **no network requests**. It reads
-Claude Code's local logs (token counts, model, time and folder only, never message
-text) and the small JSON files saved by the status line script. Nothing is uploaded or
-shared.
+`claude-top` itself makes **no network requests** and never reads your credentials.
+Once a minute it runs your own `claude` command to ask for your plan limits; `claude`
+fetches them from Anthropic with your existing sign-in, exactly as `/usage` does. No
+prompt, file or conversation is sent (`--no-check` turns this off). Everything else
+comes from Claude Code's local logs (token counts, model, time and folder only, never
+message text) and the small JSON files saved by the status line script. Nothing is
+uploaded or shared.
 
 ---
 

@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
 """claude-top: live view of Claude Code usage, in the spirit of nvtop.
 
-Plan limits (5-hour / weekly) come from the status line script
-(~/.claude/usage-monitor/statusline.py), which saves them after every Claude reply.
-Token counts come from Claude Code's local logs in ~/.claude/projects.
+Plan limits (5-hour, weekly, and per-model weekly such as Fable) are asked from the
+`claude` command every 60 seconds. This sends no prompt and uses none of your limits,
+and it covers usage everywhere (terminal, VS Code, desktop, web). The status line
+script (~/.claude/usage-monitor/statusline.py) also saves them after every terminal
+reply; whichever is newer is shown. Token counts come from Claude Code's local logs
+in ~/.claude/projects.
 
 The layout adapts to the window: narrow windows drop less important columns, short
 windows drop whole sections (least important first), spare height makes the activity
 graph taller, and windows 140+ columns wide split into two columns.
 
-Keys: q quit, r rescan logs, t next color theme (T previous). The theme is remembered.
+Keys: q quit, r rescan logs and re-check limits now, t next color theme (T previous).
+The theme is remembered.
   claude-top --once               print one plain-text snapshot and exit
   claude-top --once --size 80x24  snapshot at a given width x height
   claude-top --theme lagoon       start with a theme (also remembered for next time)
   claude-top --themes             list themes: claude, midnight, lagoon, ember, paper, classic
   claude-top --transparent        keep the terminal's own background color
   claude-top --once --color       force colors in a snapshot (--no-color to turn off)
+  claude-top --check-every 120    check plan limits every 120 seconds (minimum 30)
+  claude-top --no-check           never run `claude`; use only the status line's numbers
 """
 import curses
 import glob
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -97,6 +106,7 @@ class LogScanner:
             "out": u.get("output_tokens") or 0,
             "cr": u.get("cache_read_input_tokens") or 0,
             "cw": u.get("cache_creation_input_tokens") or 0,
+            "entry": d.get("entrypoint") or "",
         }
 
 
@@ -123,6 +133,127 @@ def load_sessions():
             continue
         out.append(s)
     return sorted(out, key=lambda s: -s.get("captured_at", 0))
+
+
+# ---------- live plan limits ----------
+
+CHECK_S = 60          # how often to ask `claude` for the plan limits
+CHECK_MIN_S = 30
+CHECK_TIMEOUT_S = 30
+CHECKED_FILE = os.path.join(STATE, "plan_checked.json")
+
+
+def find_claude():
+    path = os.environ.get("CLAUDE_TOP_CLAUDE") or shutil.which("claude")
+    if not path:
+        for p in ("~/.local/bin/claude", "~/.claude/local/claude"):
+            p = os.path.expanduser(p)
+            if os.access(p, os.X_OK):
+                return p
+    return path
+
+
+def _epoch(iso):
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def convert_usage(resp):
+    """Turn the CLI's usage answer into the status line's format, plus per-model limits."""
+    rl = resp.get("rate_limits") or {}
+    out, scoped = {}, []
+    for lim in rl.get("limits") or []:
+        if not isinstance(lim, dict) or lim.get("percent") is None:
+            continue
+        win = {"used_percentage": float(lim["percent"]), "resets_at": _epoch(lim.get("resets_at"))}
+        model = ((lim.get("scope") or {}).get("model") or {})
+        if lim.get("kind") == "session":
+            out["five_hour"] = win
+        elif lim.get("kind") == "weekly_all":
+            out["seven_day"] = win
+        elif lim.get("kind") == "weekly_scoped" and (model.get("display_name") or model.get("id")):
+            scoped.append(dict(win, name=model.get("display_name") or model.get("id")))
+    for key in ("five_hour", "seven_day"):   # older answers only have these fields
+        win = rl.get(key)
+        if key not in out and isinstance(win, dict) and win.get("utilization") is not None:
+            out[key] = {"used_percentage": float(win["utilization"]), "resets_at": _epoch(win.get("resets_at"))}
+    extra = rl.get("extra_usage") or {}
+    if extra.get("is_enabled") and extra.get("utilization") is not None:
+        out["spend_limit"] = {"used_percentage": float(extra["utilization"])}
+    return out, scoped
+
+
+def check_plan_limits():
+    """Ask the `claude` command for the account's current plan limits, the same numbers
+    /usage shows. No prompt is sent, so this uses none of your limits. Saves them to
+    CHECKED_FILE. Returns None on success, or a short reason it didn't work."""
+    claude = find_claude()
+    if not claude:
+        return "`claude` command not found"
+    req = json.dumps({"type": "control_request", "request_id": "usage", "request": {"subtype": "get_usage"}})
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        p = subprocess.run(
+            [claude, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+             "--no-session-persistence", "--strict-mcp-config", "--settings", '{"disableAllHooks": true}'],
+            input=req + "\n", capture_output=True, text=True, timeout=CHECK_TIMEOUT_S,
+            cwd=STATE, start_new_session=True)
+    except subprocess.TimeoutExpired:
+        return "`claude` didn't answer in time"
+    except OSError as e:
+        return f"couldn't run `claude` ({e.strerror})"
+    for line in p.stdout.splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        r = d.get("response") or {}
+        if d.get("type") != "control_response" or r.get("request_id") != "usage":
+            continue
+        if r.get("subtype") != "success":
+            return "`claude` couldn't get usage (signed in?)"
+        resp = r.get("response") or {}
+        if not resp.get("rate_limits_available", True) or not resp.get("rate_limits"):
+            return "no plan limits for this account"
+        rl, scoped = convert_usage(resp)
+        if not rl and not scoped:
+            return "no plan limits in the answer"
+        tmp = f"{CHECKED_FILE}.{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({"captured_at": time.time(), "rate_limits": rl, "scoped": scoped,
+                       "plan": resp.get("subscription_type")}, f)
+        os.replace(tmp, CHECKED_FILE)
+        return None
+    return "`claude` gave no usage answer (needs a newer Claude Code?)"
+
+
+class LimitChecker:
+    """Runs check_plan_limits() in the background every CHECK_S seconds, or sooner on request."""
+
+    def __init__(self, every):
+        self.every = every
+        self.error = None
+        self.last_try = 0
+        self.wake = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def now(self):
+        self.wake.set()
+
+    def _loop(self):
+        while True:
+            self.last_try = time.time()
+            try:
+                self.error = check_plan_limits()
+            except Exception as e:   # never let the checker take the screen down
+                self.error = f"check failed ({type(e).__name__})"
+            self.wake.wait(self.every)
+            self.wake.clear()
+
+
+checker = None   # set in main() unless --no-check
 
 
 # ---------- formatting ----------
@@ -361,22 +492,57 @@ def plan_title(w, recs):
     return "plan limits", ""
 
 
-def plan_content(k, w):
+STALE_AFTER_S = 120   # replies this much newer than the plan numbers trigger the warning
+ENTRY_NAMES = {"claude-vscode": "VS Code", "claude-desktop": "the desktop app"}
+
+
+def stale_note(w, recs, captured_at):
+    """Warn when Claude replied after the plan numbers were saved, e.g. in the VS Code
+    panel, which doesn't run the status line, so those replies aren't counted yet."""
+    newer = [r for r in recs if r["t"] > captured_at + STALE_AFTER_S]
+    # Terminal replies refresh the numbers themselves, so only they are left over when
+    # a terminal session doesn't run the status line (for example, one started elsewhere).
+    elsewhere = [r for r in newer if r["entry"] != "cli"]
+    newer = elsewhere or newer
+    if not newer:
+        return []
+    where = sorted({ENTRY_NAMES.get(r["entry"], "") for r in newer} - {""})
+    src = " and ".join(where) if where else "sessions without the status line"
+    if w >= 76:
+        text = f"⚠ {len(newer)} newer replies in {src} aren't counted yet; they will be after the next terminal reply"
+    elif w >= 44:
+        text = f"⚠ {len(newer)} newer replies in {src} not counted yet"
+    else:
+        text = "⚠ newer replies not counted yet"
+    return [[(text, st("hotkey"))]]
+
+
+def plan_content(k, w, recs):
     now = time.time()
-    rl_file = load_json(os.path.join(STATE, "rate_limits.json"))
+    from_line = load_json(os.path.join(STATE, "rate_limits.json"))
+    checked = load_json(CHECKED_FILE)
+    rl_file = max((f for f in (from_line, checked) if f), key=lambda f: f.get("captured_at", 0), default=None)
     if not rl_file:
+        if checker and not checker.error:
+            return [[("Checking plan limits...", st("dim"))]]
+        note = [[(f"⚠ {checker.error}", st("hotkey"))]] if checker else []
         if w >= 60:
-            return [[("No plan data yet. It appears after the next Claude reply", st("dim"))],
-                    [("(needs the status line set up, and a Pro/Max/Ultra plan).", st("dim"))]]
-        return [[("No data until the next reply.", st("dim"))]]
+            return note + [[("No plan data yet. It appears after the next Claude reply", st("dim"))],
+                           [("(needs the status line set up, and a Pro/Max/Ultra plan).", st("dim"))]]
+        return note + [[("No data until the next reply.", st("dim"))]]
     rl = rl_file.get("rate_limits") or {}
+    wins = [(key, label, short, rl.get(key)) for key, label, short in
+            (("five_hour", "5-hour", "5h"), ("seven_day", "Weekly", "wk"))]
+    # per-model weekly limits (e.g. Fable) only come from the check, never the status line
+    wins += [("scoped", m.get("name", "?")[:10], m.get("name", "?")[:3], m) for m in (checked or {}).get("scoped") or []]
+    wins.append(("spend_limit", "Spend", "$", rl.get("spend_limit")))
+    lab_w = max(7, max(len(label) + 1 for _, label, _, _ in wins))
     rows = []
-    for key, label, short in (("five_hour", "5-hour", "5h"), ("seven_day", "Weekly", "wk"), ("spend_limit", "Spend", "$")):
-        win = rl.get(key)
+    for key, label, short, win in wins:
         if not isinstance(win, dict) or win.get("used_percentage") is None:
             continue
         p = float(win["used_percentage"])
-        lab = f"{label:<7}" if w >= 36 else f"{short:<3}"
+        lab = f"{label:<{lab_w}}" if w >= 36 else f"{short:<4}"
         resets = win.get("resets_at")
         if resets and resets < now:
             rows.append((lab, None, "", ""))
@@ -396,12 +562,20 @@ def plan_content(k, w):
         bar_w = max(4, min(60, w - max(len(r[0]) + len(r[2]) + len(r[3]) for r in rows)))
         for lab, p, pct_txt, tail in rows:
             if p is None:
-                lines.append([(lab, st("title", True)), ("reset; updates on next reply", st("dim"))])
+                lines.append([(lab, st("title", True)), ("reset; updates soon", st("dim"))])
                 continue
             lines.append([(lab, st("title", True))] + meter(p, bar_w) +
                          [(pct_txt, pct_style(p, True)), (tail, st("dim"))])
+    if checker and checker.error:
+        lines.append([(f"⚠ live check: {checker.error}"[: max(1, w)], st("hotkey"))])
+        lines += stale_note(w, recs, rl_file.get("captured_at", now))
+    elif not checker:
+        lines += stale_note(w, recs, rl_file.get("captured_at", now))
     age = ago(now - rl_file.get("captured_at", now))
-    lines.append([(f"as of {age} ago" if w >= 26 else f"{age} ago", st("dim"))])
+    text = f"as of {age} ago" if w >= 26 else f"{age} ago"
+    if checker and not checker.error and w >= 40:
+        text += f" · checked every {ago(checker.every)}"
+    lines.append([(text, st("dim"))])
     return lines
 
 
@@ -687,7 +861,7 @@ def frame(scanner, h, w):
     place(out, 0, 0, usable, [header_line(usable)])
     top, avail = 1, h - 1
 
-    plan = Section("plan", 1, 9, 0, lambda cw: plan_title(cw, recs), lambda k, cw: plan_content(k, cw))
+    plan = Section("plan", 1, 9, 0, lambda cw: plan_title(cw, recs), lambda k, cw: plan_content(k, cw, recs))
     graph = Section("graph", 2, 3, GRAPH_MAX_ROWS - 1, lambda cw: graph_title(cw, recs),
                     lambda k, cw: graph_content(k, cw, recs), nlines=lambda k, cw: k + 2)
     tokens = Section("tokens", 3, 9, 0, lambda cw: ("tokens · all sessions", ""),
@@ -803,6 +977,8 @@ def run_curses(stdscr, scanner, transparent):
             scanner.offsets.clear()
             scanner.records.clear()
             last_scan = 0
+            if checker:
+                checker.now()
 
 
 def snapshot(scanner, h, w, color, transparent):
@@ -853,8 +1029,17 @@ def main():
             save_theme(name)
     else:
         set_theme(saved_theme())
+    global checker
+    every = CHECK_S
+    if "--check-every" in args:
+        try:
+            every = max(CHECK_MIN_S, int(args[args.index("--check-every") + 1]))
+        except (IndexError, ValueError):
+            sys.exit("--check-every needs a number of seconds, e.g. --check-every 120")
     scanner = LogScanner()
     if "--once" in args:
+        if "--no-check" not in args:
+            check_plan_limits()   # a snapshot waits for fresh numbers (about a second)
         scanner.scan()
         if "--size" in args:
             w, h = (int(v) for v in args[args.index("--size") + 1].lower().split("x"))
@@ -866,6 +1051,8 @@ def main():
         snapshot(scanner, h, w, color, transparent)
         return
     print("Reading Claude Code logs...", flush=True)
+    if "--no-check" not in args:
+        checker = LimitChecker(every)
     scanner.scan()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     signal.signal(signal.SIGHUP, lambda *_: sys.exit(0))
