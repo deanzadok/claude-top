@@ -175,7 +175,14 @@ def convert_usage(resp):
             out["seven_day"] = win
         elif lim.get("kind") == "weekly_scoped" and (model.get("display_name") or model.get("id")):
             scoped.append(dict(win, name=model.get("display_name") or model.get("id")))
-    for key in ("five_hour", "seven_day"):   # older answers only have these fields
+    # Per-model limits are always in model_scoped. The limits list above is missing when
+    # claude answers from its cache, so it can't be relied on for them.
+    if isinstance(rl.get("model_scoped"), list):
+        scoped = [{"name": m.get("display_name"), "used_percentage": float(m["utilization"]),
+                   "resets_at": _epoch(m.get("resets_at"))}
+                  for m in rl["model_scoped"]
+                  if isinstance(m, dict) and m.get("display_name") and m.get("utilization") is not None]
+    for key in ("five_hour", "seven_day"):   # cached answers only have these fields
         win = rl.get(key)
         if key not in out and isinstance(win, dict) and win.get("utilization") is not None:
             out[key] = {"used_percentage": float(win["utilization"]), "resets_at": _epoch(win.get("resets_at"))}
@@ -192,7 +199,7 @@ def check_plan_limits():
     claude = find_claude()
     if not claude:
         return "`claude` command not found"
-    req = json.dumps({"type": "control_request", "request_id": "usage", "request": {"subtype": "get_usage"}})
+    req = json.dumps({"type": "control_request", "request_id": "usage", "request": {"subtype": "get_usage", "skip_behaviors": True}})
     try:
         os.makedirs(STATE, exist_ok=True)
         p = subprocess.run(
